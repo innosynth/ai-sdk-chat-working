@@ -2,11 +2,9 @@
 
 import "ios-vibrator-pro-max"
 
-import type React from "react"
-import { useState, useRef, useEffect } from "react"
+import React from "react"
+import { useState, useRef, useEffect, useCallback } from "react"
 import {
-  Search,
-  Plus,
   Lightbulb,
   ArrowUp,
   Menu,
@@ -19,7 +17,9 @@ import {
   Sun,
   FileSpreadsheet,
   FileText,
-  Image,
+  File,
+  Paperclip,
+  X
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
@@ -28,16 +28,27 @@ import { useTheme } from "@/hooks/use-theme"
 import { useToast } from "@/hooks/use-toast"
 import * as XLSX from "xlsx"
 import Papa from "papaparse"
-import { processDocument, generateChatResponse } from '@/lib/vector-processor'
+import hljs from 'highlight.js';
+import 'highlight.js/styles/github-dark.css';
+import { 
+  processFile, 
+  vectorizeText, 
+  findRelevantChunks,
+  checkPythonServer
+} from '@/lib/python-api';
+import { ProcessedChunk, FileType } from '@/types/document';
 
-type ActiveButton = "none" | "add" | "deepSearch" | "think"
+type ActiveButton = "none" | "think"
 type MessageType = "user" | "system" | "file"
-type FileType = "csv" | "xlsx" | "pdf" | "doc" | "docx" | "txt" | "png" | "jpg" | "jpeg" | "gif" | "unknown"
 
 interface FileData {
   name: string
   type: FileType
   content: string | string[][] | ArrayBuffer
+  processed?: {
+    originalContent: string
+    chunks: ProcessedChunk[]
+  }
   mimeType?: string
 }
 
@@ -63,9 +74,11 @@ interface StreamingWord {
   text: string
 }
 
-// Faster word delay for smoother streaming
+// Configuration
 const WORD_DELAY = 40 // ms per word
 const CHUNK_SIZE = 2 // Number of words to add at once
+const SIMILARITY_THRESHOLD = 0.7 // Threshold for selecting relevant chunks
+const MAX_CONTEXT_CHUNKS = 5 // Max number of chunks to send as context
 
 export default function ChatInterface() {
   const [inputValue, setInputValue] = useState("")
@@ -92,9 +105,11 @@ export default function ChatInterface() {
   const selectionStateRef = useRef<{ start: number | null; end: number | null }>({ start: null, end: null })
   const { theme, toggleTheme } = useTheme()
   const { toast } = useToast()
-  const [documentContext, setDocumentContext] = useState<string>('')
-  // Add a ref to track the last message with feedback buttons
+  // Store processed file data globally for context
+  const [allProcessedChunks, setAllProcessedChunks] = useState<ProcessedChunk[]>([])
   const lastCompletedMessageRef = useRef<HTMLDivElement>(null)
+  // Python server status
+  const [isPythonServerAvailable, setIsPythonServerAvailable] = useState<boolean>(false)
 
   // Constants for layout calculations to account for the padding values
   const HEADER_HEIGHT = 48 // 12px height + padding
@@ -102,6 +117,25 @@ export default function ChatInterface() {
   const TOP_PADDING = 48 // pt-12 (3rem = 48px)
   const BOTTOM_PADDING = 128 // pb-32 (8rem = 128px)
   const ADDITIONAL_OFFSET = 16 // Reduced offset for fine-tuning
+
+  // Check Python server on mount
+  useEffect(() => {
+    const checkServer = async () => {
+      const isAvailable = await checkPythonServer();
+      setIsPythonServerAvailable(isAvailable);
+      
+      if (!isAvailable) {
+        toast({
+          title: "Python Server Unavailable",
+          description: "File processing will be limited. Please start the Python server with 'npm run dev'.",
+          variant: "destructive",
+          duration: 5000,
+        });
+      }
+    };
+    
+    checkServer();
+  }, [toast]);
 
   // Check if device is mobile and get viewport height
   useEffect(() => {
@@ -133,6 +167,14 @@ export default function ChatInterface() {
       window.removeEventListener("resize", checkMobileAndViewport)
     }
   }, [isMobile, viewportHeight])
+
+  // Initialize highlight.js
+  useEffect(() => {
+    hljs.configure({
+      languages: ['javascript', 'typescript', 'python', 'jsx', 'tsx', 'html', 'css', 'json', 'bash'],
+      ignoreUnescapedHTML: true
+    });
+  }, []);
 
   // Organize messages into sections
   useEffect(() => {
@@ -268,77 +310,74 @@ export default function ChatInterface() {
     }
   }
 
-  const simulateTextStreaming = async (text: string) => {
-    // Split text into words
-    const words = text.split(" ")
-    let currentIndex = 0
-    setStreamingWords([])
-    setIsStreaming(true)
-
-    return new Promise<void>((resolve) => {
-      const streamInterval = setInterval(() => {
-        if (currentIndex < words.length) {
-          // Add a few words at a time
-          const nextIndex = Math.min(currentIndex + CHUNK_SIZE, words.length)
-          const newWords = words.slice(currentIndex, nextIndex)
-
-          setStreamingWords((prev) => [
-            ...prev,
-            {
-              id: Date.now() + currentIndex,
-              text: newWords.join(" ") + " ",
-            },
-          ])
-
-          currentIndex = nextIndex
-        } else {
-          clearInterval(streamInterval)
-          resolve()
-        }
-      }, WORD_DELAY)
-    })
-  }
-
-  const fetchAIResponse = async (userMessage: string) => {
-    try {
-      const response = await fetch("http://192.168.1.1/", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ query: userMessage }),
-      })
-
-      if (!response.ok) {
-        throw new Error("Failed to get response from AI model")
-      }
-
-      const data = await response.json()
-      return data.response || "I'm sorry, I couldn't generate a response at this time."
-    } catch (error) {
-      console.error("Error fetching AI response:", error)
-      return "I'm sorry, there was an error connecting to the AI model. Please try again later."
+  // Function to find relevant chunks based on user query
+  const findRelevantChunksLocal = useCallback(async (query: string): Promise<ProcessedChunk[]> => {
+    console.log("findRelevantChunksLocal called with query:", query);
+    console.log("Current allProcessedChunks:", allProcessedChunks.length, "chunks available");
+    
+    if (allProcessedChunks.length === 0) {
+      console.log("No processed chunks available");
+      return [];
     }
-  }
+
+    try {
+      // If Python server is available, use it
+      if (isPythonServerAvailable) {
+        console.log("Using Python server to find relevant chunks");
+        try {
+          const result = await findRelevantChunks(query, allProcessedChunks, SIMILARITY_THRESHOLD, MAX_CONTEXT_CHUNKS);
+          console.log("Python server returned relevant chunks:", result.relevantChunks.length);
+          
+          // If we got relevant chunks, return them
+          if (result.relevantChunks && result.relevantChunks.length > 0) {
+            return result.relevantChunks;
+          } else {
+            // If no relevant chunks from the server despite having documents, use recent chunks as fallback
+            console.log("No relevant chunks returned by server, using fallback method");
+          }
+        } catch (pythonServerError) {
+          console.error("Error from Python server:", pythonServerError);
+          console.log("Using fallback chunk retrieval method");
+        }
+      } 
+      
+      // Fallback method - use the most recent chunks
+      console.log("Using fallback method to find relevant chunks");
+      
+      // Sort chunks by order of addition (simplification: just use the last MAX_CONTEXT_CHUNKS)
+      const recentChunks = [...allProcessedChunks].slice(-MAX_CONTEXT_CHUNKS);
+      
+      console.log(`Fallback: Using ${recentChunks.length} most recent chunks`);
+      return recentChunks;
+    } catch (error) {
+      console.error("Error finding relevant chunks:", error);
+      // Return a few recent chunks as last resort
+      return allProcessedChunks.slice(-3);
+    }
+  }, [allProcessedChunks, isPythonServerAvailable]);
 
   // Add a function to ensure feedback buttons are visible
   const scrollToEnsureFeedbackButtonsVisible = () => {
+    // Extra padding to ensure the buttons are fully visible
+    const EXTRA_PADDING = 200; // Increased to 200px for better visibility
+
     setTimeout(() => {
-      if (lastCompletedMessageRef.current && chatContainerRef.current) {
-        const feedbackButtonsRect = lastCompletedMessageRef.current.getBoundingClientRect()
-        const inputContainerRect = inputContainerRef.current?.getBoundingClientRect()
-        
+      if (lastCompletedMessageRef.current && chatContainerRef.current && inputContainerRef.current) {
+        const feedbackButtonsRect = lastCompletedMessageRef.current.getBoundingClientRect();
+        const inputContainerRect = inputContainerRef.current.getBoundingClientRect();
+
         if (inputContainerRect && feedbackButtonsRect.bottom > inputContainerRect.top) {
           // Calculate how much additional scrolling is needed
-          const additionalScroll = feedbackButtonsRect.bottom - inputContainerRect.top + 20 // 20px extra padding
-          
+          const additionalScroll = feedbackButtonsRect.bottom - inputContainerRect.top + EXTRA_PADDING;
+
+          // Use smooth scrolling for better user experience
           chatContainerRef.current.scrollBy({
             top: additionalScroll,
             behavior: 'smooth'
-          })
+          });
         }
       }
-    }, 100) // Short delay to ensure DOM is updated
+    }, 500); // Increased delay to ensure DOM is fully updated
   }
 
   const handleAIResponse = async (userMessage: string) => {
@@ -346,11 +385,27 @@ export default function ChatInterface() {
     const messageId = Date.now().toString()
     setStreamingMessageId(messageId)
 
+    // Find relevant context from processed documents
+    console.log("Finding relevant context for message:", userMessage);
+    console.log("All processed chunks available:", allProcessedChunks.length);
+    const relevantContextChunks = await findRelevantChunksLocal(userMessage);
+    console.log("Relevant context chunks found:", relevantContextChunks.length);
+    
+    // Debug the content of relevant chunks 
+    if (relevantContextChunks.length > 0) {
+      console.log("Document context that will be sent to AI:");
+      relevantContextChunks.forEach((chunk, i) => {
+        console.log(`Chunk ${i}: ${chunk.text.substring(0, 100)}...`);
+      });
+    } else {
+      console.warn("NO DOCUMENT CONTEXT FOUND - AI will respond without document knowledge");
+    }
+
     setMessages((prev) => [
       ...prev,
       {
         id: messageId,
-        content: "",
+        content: "", // Start empty
         type: "system",
       },
     ])
@@ -361,25 +416,143 @@ export default function ChatInterface() {
       navigator.vibrate(50)
     }, 200)
 
+    // Auto-scroll to the bottom when response starts
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTo({
+        top: chatContainerRef.current.scrollHeight,
+        behavior: 'smooth'
+      });
+    }
+
     try {
-      // Generate response using Gemini API with document context
-      const response = await generateChatResponse(userMessage, documentContext)
+      // Reset streaming words and set streaming state
+      setStreamingWords([]);
+      setIsStreaming(true);
 
-      // Stream the text
-      await simulateTextStreaming(response)
+      // Track word count for periodic scrolling
+      let wordCount = 0;
+      let streamedContent = ""; // Accumulate streamed content
 
-      // Update with complete message
+      // Prepare the full prompt with document context
+      const contextPrompt = relevantContextChunks.length > 0 
+        ? `Context from uploaded documents:\n---\n${relevantContextChunks.map(chunk => chunk.text).join('\n\n')}\n---\n\nUser Question: ${userMessage}`
+        : userMessage;
+        
+      console.log("Sending to AI model:", contextPrompt.substring(0, 200) + "...");
+
+      // Call AI with relevant chunks
+      await fetch('https://dq2jqf0v-8080.inc1.devtunnels.ms/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: "tgi",
+          messages: [
+            {
+              role: "user",
+              content: contextPrompt
+            }
+          ],
+          max_tokens: 1500,
+          stream: true,
+        }),
+      }).then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP error! Status: ${response.status}`);
+        }
+        
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error('Response body is null');
+        
+        const decoder = new TextDecoder();
+        
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            const chunk = decoder.decode(value, { stream: true });
+            
+            // Process SSE data format
+            const lines = chunk.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                // Skip [DONE] line
+                if (line.includes('[DONE]')) continue;
+                
+                try {
+                  // Parse the JSON data
+                  const jsonData = JSON.parse(line.substring(6));
+                  
+                  // Extract the content chunk from the response
+                  if (jsonData.choices && jsonData.choices.length > 0) {
+                    const contentChunk = jsonData.choices[0].delta?.content || jsonData.choices[0].message?.content || '';
+                    if (contentChunk) {
+                      streamedContent += contentChunk;
+                      setStreamingWords((prev) => [
+                        ...prev,
+                        {
+                          id: Date.now() + Math.random(), // Ensure unique ID
+                          text: contentChunk,
+                        },
+                      ]);
+                      
+                      // Auto-scroll every 5 words to keep up with new content
+                      wordCount++;
+                      if (wordCount % 5 === 0 && chatContainerRef.current) {
+                        requestAnimationFrame(() => {
+                          if (chatContainerRef.current) {
+                            chatContainerRef.current.scrollTo({
+                              top: chatContainerRef.current.scrollHeight,
+                              behavior: 'auto' // Use 'auto' for smoother continuous scrolling during streaming
+                            });
+                          }
+                        });
+                      }
+                    }
+                  }
+                } catch (error) {
+                  console.error('Error parsing SSE data:', error, line);
+                }
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      });
+
+      // Update the message content *after* streaming is complete
       setMessages((prev) =>
-        prev.map((msg) => (msg.id === messageId ? { ...msg, content: response, completed: true } : msg)),
-      )
+        prev.map((msg) =>
+          msg.id === messageId ? { ...msg, content: streamedContent, completed: true } : msg
+        )
+      );
 
       // Add to completed messages set to prevent re-animation
       setCompletedMessages((prev) => new Set(prev).add(messageId))
-      
-      // Ensure feedback buttons are visible after message completes
-      scrollToEnsureFeedbackButtonsVisible()
+
+      // Final scroll after streaming completes to ensure all content is visible
+      if (chatContainerRef.current) {
+        setTimeout(() => {
+          if (chatContainerRef.current) {
+            chatContainerRef.current.scrollTo({
+              top: chatContainerRef.current.scrollHeight,
+              behavior: 'smooth'
+            });
+
+            // After scrolling to end, ensure feedback buttons are visible
+            scrollToEnsureFeedbackButtonsVisible();
+          }
+        }, 100);
+      } else {
+        // Ensure feedback buttons are visible after message completes
+        scrollToEnsureFeedbackButtonsVisible();
+      }
     } catch (error) {
       console.error("Error in AI response:", error)
+      const errorMessage = error instanceof Error ? error.message : "An unknown error occurred."
 
       // Update with error message
       setMessages((prev) =>
@@ -387,7 +560,7 @@ export default function ChatInterface() {
           msg.id === messageId
             ? {
                 ...msg,
-                content: "Sorry, I encountered an error while processing your request. Please try again.",
+                content: `Sorry, I encountered an error: ${errorMessage}`,
                 completed: true,
               }
             : msg,
@@ -396,7 +569,7 @@ export default function ChatInterface() {
 
       // Add to completed messages set
       setCompletedMessages((prev) => new Set(prev).add(messageId))
-      
+
       // Ensure feedback buttons are visible after error message
       scrollToEnsureFeedbackButtonsVisible()
     }
@@ -515,119 +688,238 @@ export default function ChatInterface() {
   }
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-      const file = e.target.files[0]
-      const fileExtension = file.name.split('.').pop()?.toLowerCase()
-      const mimeType = file.type
-
-      // Check if file type is supported
-      const supportedTypes = ['csv', 'xlsx', 'pdf', 'doc', 'docx', 'txt', 'png', 'jpg', 'jpeg', 'gif']
-      if (!supportedTypes.includes(fileExtension || '')) {
-        toast({
-          title: "Invalid file format",
-          description: "Please upload a supported file type (CSV, XLSX, PDF, DOC, DOCX, TXT, PNG, JPG, JPEG, GIF)",
-          variant: "destructive",
-        })
-        return
-      }
-
-      try {
-        let fileType: FileType = fileExtension as FileType
-        let content: string | string[][] | ArrayBuffer = ""
-
-        // Process CSV file
-        if (fileExtension === "csv") {
-          const text = await file.text()
-          content = text
-          Papa.parse(text, {
-            complete: (results) => {
-              addFileMessage(file.name, fileType, results.data as string[][])
-              // Process document for context
-              processDocument({
-                name: file.name,
-                type: fileType,
-                content: results.data as string[][]
-              }).then(processedContent => {
-                setDocumentContext(processedContent)
-              })
-            },
-            error: (error: Error) => {
-              throw new Error(`Error parsing CSV: ${error}`)
-            },
-          })
-        }
-        // Process XLSX file
-        else if (fileExtension === "xlsx") {
-          const arrayBuffer = await file.arrayBuffer()
-          content = arrayBuffer
-          const workbook = XLSX.read(arrayBuffer)
-          const sheetName = workbook.SheetNames[0]
-          const worksheet = workbook.Sheets[sheetName]
-          const data = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as string[][]
-          addFileMessage(file.name, fileType, data)
-          // Process document for context
-          const processedContent = await processDocument({
-            name: file.name,
-            type: fileType,
-            content: data
-          })
-          setDocumentContext(processedContent)
-        }
-        // Process text files
-        else if (fileExtension === "txt") {
-          const text = await file.text()
-          content = text
-          addFileMessage(file.name, fileType, text)
-          // Process document for context
-          setDocumentContext(text)
-        }
-        // Process binary files (PDF, DOC, DOCX, images)
-        else {
-          const arrayBuffer = await file.arrayBuffer()
-          content = arrayBuffer
-          addFileMessage(file.name, fileType, arrayBuffer, mimeType)
-          // Process document for context
-          const processedContent = await processDocument({
-            name: file.name,
-            type: fileType,
-            content: arrayBuffer,
-            mimeType
-          })
-          setDocumentContext(processedContent)
-        }
-      } catch (error) {
-        console.error("Error processing file:", error)
-        toast({
-          title: "Error processing file",
-          description: "There was an error processing your file. Please try again.",
-          variant: "destructive",
-        })
-      }
-
-      // Reset file input
-      e.target.value = ""
+    if (!e.target.files || e.target.files.length === 0) return;
+    
+    console.log("File upload triggered");
+    const file = e.target.files[0];
+    const fileExtension = file.name.split('.').pop()?.toLowerCase() as FileType;
+    const mimeType = file.type;
+    
+    console.log("File details:", { 
+      name: file.name, 
+      type: fileExtension, 
+      mimeType,
+      size: file.size 
+    });
+    
+    // Check if we have over 100MB file
+    if (file.size > 100 * 1024 * 1024) {
+      toast({
+        title: "File too large",
+        description: "Please upload a file smaller than 100MB",
+        variant: "destructive",
+      });
+      return;
     }
+    
+    // Create a placeholder message to show file is being processed
+    const placeholderId = Date.now().toString();
+    
+    // Add placeholder message using the existing function
+    addFileMessage(file.name, fileExtension, "Processing file...", placeholderId, true, mimeType);
+
+    try {
+      let processedData;
+
+      // Check if Python server is available for processing
+      if (isPythonServerAvailable) {
+        console.log("Using Python server to process file");
+        // Process the file using the Python backend
+        processedData = await processFile(file);
+        console.log("File processed by Python server:", processedData);
+        console.log("Number of chunks extracted:", processedData.chunks.length);
+        
+        // Debug log a sample of the chunks
+        if (processedData.chunks.length > 0) {
+          console.log("Sample of first chunk:", processedData.chunks[0].text.substring(0, 100) + "...");
+          console.log("Vector dimension:", processedData.chunks[0].vector.length);
+        }
+      } else {
+        // Fallback to client-side processing with limited capabilities
+        processedData = await fallbackProcessFile(file, fileExtension);
+      }
+
+      // Add the processed chunks to the global context
+      if (processedData && processedData.chunks.length > 0) {
+        console.log("Adding processed chunks to global context:", processedData.chunks.length, "chunks");
+        
+        // Create a new array to ensure state changes are detected
+        setAllProcessedChunks(prev => {
+          // We first check if we have duplicate chunks to avoid repetition
+          const existingChunkTexts = new Set(prev.map(chunk => chunk.text.trim().substring(0, 100)));
+          const uniqueNewChunks = processedData.chunks.filter(
+            newChunk => !existingChunkTexts.has(newChunk.text.trim().substring(0, 100))
+          );
+          
+          console.log(`Found ${uniqueNewChunks.length} unique new chunks to add`);
+          const newChunks = [...prev, ...uniqueNewChunks];
+          console.log("New allProcessedChunks state:", newChunks.length, "total chunks");
+          
+          // Force state update since the array reference changed
+          return [...newChunks];
+        });
+        
+        // Update UI with success message
+        toast({
+          title: "File Processed",
+          description: `${file.name} processed into ${processedData.chunks.length} chunks and added to context.`,
+        });
+        
+        // Update the placeholder message with final file info
+        updateFileMessage(
+          placeholderId, 
+          file.name, 
+          fileExtension, 
+          "File content processed", 
+          processedData,
+          mimeType
+        );
+      } else {
+        throw new Error("File processing resulted in no usable chunks.");
+      }
+    } catch (error) {
+      console.error("Error processing file:", error);
+      const errorMsg = error instanceof Error ? error.message : "Unknown processing error.";
+      toast({
+        title: "Error processing file",
+        description: `Could not process ${file.name}: ${errorMsg}`,
+        variant: "destructive",
+      });
+      // Remove the placeholder message on error
+      removeMessage(placeholderId);
+    }
+
+    // Reset file input
+    if (e.target) e.target.value = "";
   }
 
-  const addFileMessage = (fileName: string, fileType: FileType, content: string | string[][] | ArrayBuffer, mimeType?: string) => {
-    // Add as a new section if messages already exist
-    const shouldAddNewSection = messages.length > 0
+  // Fallback file processing for when Python server is unavailable
+  const fallbackProcessFile = async (file: File, fileType: FileType): Promise<{
+    originalContent: string;
+    chunks: ProcessedChunk[];
+    fileName: string;
+    fileType: string;
+  }> => {
+    let content = "";
+    const chunks: ProcessedChunk[] = [];
+    const CHUNK_SIZE = 500;
+    
+    // Basic text extraction
+    if (fileType === 'txt') {
+      content = await file.text();
+    } else if (fileType === 'csv') {
+      const text = await file.text();
+      const result = Papa.parse(text);
+      content = result.data.map(row => (row as string[]).join(', ')).join('\n');
+    } else if (fileType === 'xlsx') {
+      const arrayBuffer = await file.arrayBuffer();
+      const wb = XLSX.read(arrayBuffer);
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const data = XLSX.utils.sheet_to_json(ws, { header: 1 }) as string[][];
+      content = data.map(row => row.join(', ')).join('\n');
+    } else {
+      // For other file types, we can only provide basic info
+      content = `File ${file.name} (${fileType.toUpperCase()}) - Client-side processing limited.`;
+    }
+    
+    // Create basic chunks without proper vectors (dummy vectors)
+    for (let i = 0; i < content.length; i += CHUNK_SIZE) {
+      const chunkText = content.slice(i, i + CHUNK_SIZE);
+      if (chunkText.trim()) {
+        chunks.push({
+          text: chunkText,
+          vector: new Array(512).fill(0) // Dummy vector
+        });
+        
+        if (chunks.length >= 50) break; // Limit chunks
+      }
+    }
+    
+    return {
+      originalContent: content,
+      chunks,
+      fileName: file.name,
+      fileType
+    };
+  };
 
-    const newFileMessage = {
-      id: `file-${Date.now()}`,
-      content: `File: ${fileName}`,
-      type: "file" as MessageType,
-      newSection: shouldAddNewSection,
-      fileData: {
+  // Adds or updates a file message
+  const addOrUpdateFileMessage = (
+    id: string,
+    fileName: string,
+    fileType: FileType,
+    content: string | string[][] | ArrayBuffer,
+    isProcessing: boolean,
+    processedData?: {
+      originalContent: string;
+      chunks: ProcessedChunk[];
+    },
+    mimeType?: string
+  ) => {
+    const shouldAddNewSection = messages.length === 0 || messages[messages.length - 1].type !== 'file';
+
+    const fileMessageData: FileData = {
         name: fileName,
         type: fileType,
-        content: content,
-        mimeType: mimeType
-      },
-    }
+        content, // Store content
+        processed: processedData,
+        mimeType
+      };
 
-    // Add the file message
-    setMessages((prev) => [...prev, newFileMessage])
+    const newMessage: Message = {
+      id,
+      content: isProcessing ? `Processing: ${fileName}` : `File: ${fileName}`,
+      type: "file",
+      newSection: shouldAddNewSection,
+      fileData: fileMessageData,
+      completed: !isProcessing, // Mark as incomplete if processing
+    };
+
+    setMessages(prev => {
+        // Check if a message with this ID already exists (for updates)
+        const existingIndex = prev.findIndex(msg => msg.id === id);
+        if (existingIndex > -1) {
+            // Update existing message
+            const updatedMessages = [...prev];
+            updatedMessages[existingIndex] = newMessage;
+            return updatedMessages;
+        } else {
+            // Add new message
+            return [...prev, newMessage];
+        }
+    });
+  };
+
+  // Specific function to add a new file message (usually placeholder)
+  const addFileMessage = (
+      fileName: string,
+      fileType: FileType,
+      content: string | string[][] | ArrayBuffer,
+      id: string,
+      isProcessing: boolean,
+      mimeType?: string
+      ) => {
+      addOrUpdateFileMessage(id, fileName, fileType, content, isProcessing, undefined, mimeType);
+  }
+
+  // Specific function to update a file message (after processing)
+  const updateFileMessage = (
+      id: string,
+      fileName: string,
+      fileType: FileType,
+      content: string | string[][] | ArrayBuffer,
+      processedData: {
+        originalContent: string;
+        chunks: ProcessedChunk[];
+      },
+      mimeType?: string
+      ) => {
+      addOrUpdateFileMessage(id, fileName, fileType, content, false, processedData, mimeType);
+  }
+
+  // Function to remove a message by ID
+  const removeMessage = (id: string) => {
+      setMessages(prev => prev.filter(msg => msg.id !== id));
   }
 
   const handleCopyText = (text: string) => {
@@ -674,396 +966,332 @@ export default function ChatInterface() {
   }
 
   const refreshPage = () => {
-    window.location.reload()
+    console.log("Clearing chat and document context");
+    // Clear processed chunks first
+    setAllProcessedChunks([]);
+    // Then clear messages
+    setMessages([]);
+    // Clear streaming state if any
+    setStreamingWords([]);
+    setIsStreaming(false);
+    setStreamingMessageId(null);
+    // Clear sections
+    setMessageSections([]);
+    // Confirm with toast
+    toast({ 
+      title: "Chat Cleared", 
+      description: "Document context and conversation have been cleared"
+    });
   }
+
+  // Function to format message content with bold text and code blocks
+  const formatMessageContent = (content: string) => {
+    if (!content) return null;
+    
+    // First handle code blocks
+    const codeBlockRegex = /```([a-z]*)\n([\s\S]*?)```/g;
+    let formattedContent = [];
+    let lastIndex = 0;
+    let match;
+    
+    // Find all code blocks
+    while ((match = codeBlockRegex.exec(content)) !== null) {
+      // Add text before code block
+      if (match.index > lastIndex) {
+        const textBeforeBlock = content.slice(lastIndex, match.index);
+        formattedContent.push(
+          <span key={`text-${lastIndex}`}>
+            {formatBoldText(textBeforeBlock)}
+          </span>
+        );
+      }
+      
+      // Add code block with syntax highlighting
+      const language = match[1].trim() || 'plaintext';
+      const code = match[2].trim();
+      
+      // Apply syntax highlighting
+      let highlightedCode;
+      try {
+        if (language !== 'plaintext') {
+          highlightedCode = hljs.highlight(code, { language }).value;
+        } else {
+          highlightedCode = hljs.highlightAuto(code).value;
+        }
+      } catch (e) {
+        // Fallback if language mode fails
+        highlightedCode = hljs.highlightAuto(code).value;
+      }
+      
+      formattedContent.push(
+        <div key={`code-${match.index}`} className="my-2 overflow-hidden rounded-md bg-gray-900 text-white">
+          {language !== 'plaintext' && (
+            <div className="bg-gray-800 px-4 py-1 text-xs text-gray-400">
+              {language}
+            </div>
+          )}
+          <pre className="p-4 overflow-x-auto">
+            <code dangerouslySetInnerHTML={{ __html: highlightedCode }} />
+          </pre>
+          <div className="relative">
+            <Button
+              variant="secondary"
+              size="icon"
+              className="absolute top-3 right-3 h-7 w-7 rounded-md bg-gray-700 p-0"
+              onClick={() => handleCopyText(code)}
+              aria-label="Copy code"
+            >
+              <Copy className="h-3.5 w-3.5 text-gray-300" />
+            </Button>
+          </div>
+        </div>
+      );
+      
+      lastIndex = match.index + match[0].length;
+    }
+    
+    // Add remaining text after the last code block
+    if (lastIndex < content.length) {
+      const remainingText = content.slice(lastIndex);
+      formattedContent.push(
+        <span key={`text-end`}>
+          {formatBoldText(remainingText)}
+        </span>
+      );
+    }
+    
+    return formattedContent.length > 0 ? formattedContent : formatBoldText(content);
+  };
+
+  // Helper function to format bold text (using ** syntax)
+  const formatBoldText = (text: string) => {
+    if (!text) return text;
+    
+    const parts = text.split(/(\*\*.*?\*\*)/g);
+    return parts.map((part, i) => {
+      if (part.startsWith('**') && part.endsWith('**')) {
+        // Bold text - remove the ** markers and apply bold styling
+        return <strong key={i}>{part.slice(2, -2)}</strong>;
+      }
+      return part;
+    });
+  };
 
   const renderFilePreview = (fileData: FileData) => {
-    // Handle spreadsheet files (CSV, XLSX)
-    if (fileData.type === "csv" || fileData.type === "xlsx") {
-      const data = fileData.content as string[][]
-      const previewData = data.slice(0, 10)
-
-      return (
-        <div className="file-preview">
-          <div className="file-preview-header">
-            <div className="file-preview-title">
-              <FileSpreadsheet className="h-4 w-4" />
-              {fileData.name}
-            </div>
-          </div>
-          <div className="file-preview-content">
-            <table className="file-preview-table">
-              <thead>
-                <tr>
-                  {previewData[0]?.map((cell, i) => (
-                    <th key={i}>{cell}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {previewData.slice(1).map((row, i) => (
-                  <tr key={i}>
-                    {row.map((cell, j) => (
-                      <td key={j}>{cell}</td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {data.length > 10 && <div className="text-xs text-gray-500 mt-2">Showing 10 of {data.length} rows</div>}
-          </div>
-        </div>
-      )
+    const getIcon = (type: FileType) => {
+        switch (type) {
+            case 'csv':
+            case 'xlsx': return <FileSpreadsheet className="h-4 w-4 mr-2 flex-shrink-0" />;
+            case 'pdf': return <FileText className="h-4 w-4 mr-2 flex-shrink-0" />;
+            case 'docx': return <FileText className="h-4 w-4 mr-2 flex-shrink-0" />;
+            case 'txt': return <FileText className="h-4 w-4 mr-2 flex-shrink-0" />;
+            case 'json': return <FileText className="h-4 w-4 mr-2 flex-shrink-0" />;
+            default: return <File className="h-4 w-4 mr-2 flex-shrink-0" />;
+        }
     }
 
-    // Handle text files
-    if (fileData.type === "txt") {
-      const text = fileData.content as string
-      const previewText = text.slice(0, 500) + (text.length > 500 ? "..." : "")
-
-      return (
-        <div className="file-preview">
-          <div className="file-preview-header">
-            <div className="file-preview-title">
-              <FileText className="h-4 w-4" />
-              {fileData.name}
-            </div>
-          </div>
-          <div className="file-preview-content">
-            <pre className="whitespace-pre-wrap">{previewText}</pre>
-            {text.length > 500 && <div className="text-xs text-gray-500 mt-2">Showing first 500 characters</div>}
-          </div>
-        </div>
-      )
-    }
-
-    // Handle images
-    if (fileData.type === "png" || fileData.type === "jpg" || fileData.type === "jpeg" || fileData.type === "gif") {
-      const arrayBuffer = fileData.content as ArrayBuffer
-      const blob = new Blob([arrayBuffer], { type: fileData.mimeType })
-      const url = URL.createObjectURL(blob)
-
-      return (
-        <div className="file-preview">
-          <div className="file-preview-header">
-            <div className="file-preview-title">
-              <Image className="h-4 w-4" />
-              {fileData.name}
-            </div>
-          </div>
-          <div className="file-preview-content">
-            <img src={url} alt={fileData.name} className="max-w-full h-auto" />
-          </div>
-        </div>
-      )
-    }
-
-    // Handle PDF, DOC, DOCX
-    if (fileData.type === "pdf" || fileData.type === "doc" || fileData.type === "docx") {
-      return (
-        <div className="file-preview">
-          <div className="file-preview-header">
-            <div className="file-preview-title">
-              <FileText className="h-4 w-4" />
-              {fileData.name}
-            </div>
-          </div>
-          <div className="file-preview-content">
-            <p>Binary file: {fileData.name}</p>
-            <p className="text-sm text-gray-500">Preview not available for this file type</p>
-          </div>
-        </div>
-      )
-    }
-
-    return null
-  }
-
-  const renderMessage = (message: Message) => {
-    const isCompleted = completedMessages.has(message.id)
-
-    if (message.type === "file" && message.fileData) {
-      return (
-        <div key={message.id} className="flex flex-col items-end">
-          <div className="max-w-[80%]">{renderFilePreview(message.fileData)}</div>
-        </div>
-      )
-    }
-
+    const isProcessed = !!fileData.processed;
+    const statusText = isProcessed ? `${fileData.processed?.chunks.length} chunks processed` : "Processing...";
+    const statusColor = isProcessed ? "text-green-600 dark:text-green-400" : "text-yellow-600 dark:text-yellow-400";
+    
+    // Determine if we should show a preview
+    const hasPreview = isProcessed && fileData.processed?.previewContent;
+    
     return (
-      <div key={message.id} className={cn("flex flex-col", message.type === "user" ? "items-end" : "items-start")}>
-        <div
-          className={cn(
-            "max-w-[80%] px-4 py-2 rounded-2xl",
-            message.type === "user"
-              ? "bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-br-none"
-              : "bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-gray-100",
-          )}
-        >
-          {/* For user messages or completed system messages, render without animation */}
-          {message.content && (
-            <span className={message.type === "system" && !isCompleted ? "animate-fade-in" : ""}>
-              {message.content}
-            </span>
-          )}
-
-          {/* For streaming messages, render with animation */}
-          {message.id === streamingMessageId && (
-            <span className="inline">
-              {streamingWords.map((word) => (
-                <span key={word.id} className="animate-fade-in inline">
-                  {word.text}
-                </span>
-              ))}
-            </span>
+        <div className="file-preview bg-gray-100 dark:bg-gray-800 p-3 rounded-lg border border-gray-200 dark:border-gray-700">
+          <div className="file-preview-header flex items-center justify-between mb-2">
+            <div className="file-preview-title flex items-center text-sm font-medium text-gray-800 dark:text-gray-200">
+              {getIcon(fileData.type)}
+              <span className="truncate" title={fileData.name}>{fileData.name}</span>
+            </div>
+            <span className={`text-xs font-mono ${statusColor}`}>{statusText}</span>
+          </div>
+          
+          {/* File content preview for processed files */}
+          {hasPreview && (
+            <div className="file-preview-content mt-2 border-t border-gray-200 dark:border-gray-700 pt-2">
+              <div className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Preview:</div>
+              <div className="bg-gray-50 dark:bg-gray-900 rounded p-2 text-xs font-mono overflow-auto max-h-40 whitespace-pre-wrap">
+                {fileData.processed?.previewContent}
+              </div>
+            </div>
           )}
         </div>
-
-        {/* Message actions */}
-        {message.type === "system" && message.completed && (
-          <div 
-            ref={message.id === Array.from(completedMessages).pop() ? lastCompletedMessageRef : null}
-            className="flex items-center gap-2 px-4 mt-1 mb-2"
-          >
-            <button
-              className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
-              onClick={() => handleCopyText(message.content)}
-              aria-label="Copy to clipboard"
-            >
-              <Copy className="h-4 w-4" />
-            </button>
-            <button
-              className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
-              onClick={() => handleShareText(message.content)}
-              aria-label="Share"
-            >
-              <Share2 className="h-4 w-4" />
-            </button>
-            <button
-              className="text-gray-400 hover:text-green-500 transition-colors"
-              onClick={() => handleFeedback(message.id, true)}
-              aria-label="Like"
-            >
-              <ThumbsUp className="h-4 w-4" />
-            </button>
-            <button
-              className="text-gray-400 hover:text-red-500 transition-colors"
-              onClick={() => handleFeedback(message.id, false)}
-              aria-label="Dislike"
-            >
-              <ThumbsDown className="h-4 w-4" />
-            </button>
-          </div>
-        )}
-      </div>
-    )
-  }
-
-  // Determine if a section should have fixed height (only for sections after the first)
-  const shouldApplyHeight = (sectionIndex: number) => {
-    return sectionIndex > 0
+      );
   }
 
   return (
     <div
       ref={mainContainerRef}
-      className="bg-gray-50 dark:bg-gray-900 flex flex-col overflow-hidden"
-      style={{ height: isMobile ? `${viewportHeight}px` : "100svh" }}
+      className={cn(
+        "flex flex-col h-screen bg-background text-foreground transition-colors duration-200",
+        theme,
+        "overflow-hidden", // Prevent body scroll
+      )}
     >
-      <header className="fixed top-0 left-0 right-0 h-12 flex items-center px-4 z-20 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800">
-        <div className="w-full flex items-center justify-between px-2">
-          <Button variant="ghost" size="icon" className="rounded-full h-8 w-8">
-            <Menu className="h-5 w-5 text-gray-700 dark:text-gray-300" />
-            <span className="sr-only">Menu</span>
+      {/* Header */}
+      <header className="flex items-center justify-between p-3 border-b border-border sticky top-0 bg-background/80 backdrop-blur-sm z-10 h-12">
+        <div className="flex items-center">
+          {/* Replace with Menu icon */}
+          <Button variant="ghost" size="icon" className="mr-2">
+            <Menu className="h-5 w-5" />
           </Button>
-
-          <h1 className="text-base font-medium text-gray-800 dark:text-gray-200">Luminar Chat</h1>
-
-          <div className="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="rounded-full h-8 w-8"
-              onClick={toggleTheme}
-              aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-            >
-              {theme === "dark" ? (
-                <Sun className="h-5 w-5 text-gray-300" />
-              ) : (
-                <Moon className="h-5 w-5 text-gray-700" />
-              )}
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="rounded-full h-8 w-8"
-              onClick={refreshPage}
-              aria-label="Refresh page"
-            >
-              <RefreshCw className="h-5 w-5 text-gray-700 dark:text-gray-300" />
-            </Button>
-          </div>
+          <h1 className="text-lg font-semibold">QwickChat</h1>
+        </div>
+        <div className="flex items-center space-x-2">
+          {/* Python server status indicator */}
+          {isPythonServerAvailable ? (
+            <span className="text-xs text-green-500 mr-2">Python Server Active</span>
+          ) : (
+            <span className="text-xs text-red-500 mr-2">Python Server Inactive</span>
+          )}
+          {/* Refresh button */}
+          <Button variant="ghost" size="icon" onClick={refreshPage} title="Clear Chat">
+            <RefreshCw className="h-5 w-5" />
+          </Button>
+          {/* Theme toggle button */}
+          <Button variant="ghost" size="icon" onClick={toggleTheme} title="Toggle Theme">
+            {theme === "dark" ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+          </Button>
         </div>
       </header>
 
-      <div ref={chatContainerRef} className="flex-grow pb-32 pt-12 px-4 overflow-y-auto">
-        <div className="max-w-3xl mx-auto space-y-4">
+      {/* Chat Content Area */}
+      <div
+        ref={chatContainerRef}
+        className="flex-1 overflow-y-auto px-4 pt-12 pb-32 relative scroll-smooth"
+        style={{ maxHeight: `calc(${isMobile ? viewportHeight + "px" : "100vh"} - ${HEADER_HEIGHT}px - ${INPUT_AREA_HEIGHT}px)` }}
+      >
+        <div className="mx-auto max-w-3xl">
           {messageSections.map((section, sectionIndex) => (
-            <div
-              key={section.id}
-              ref={sectionIndex === messageSections.length - 1 && section.isNewSection ? newSectionRef : null}
-            >
-              {section.isNewSection && (
+            <div key={section.id} ref={section.isActive ? newSectionRef : null} className="mb-8 last:mb-0">
+              {section.messages.map((message, msgIndex) => (
                 <div
-                  style={
-                    section.isActive && shouldApplyHeight(section.sectionIndex)
-                      ? { height: `${getContentHeight()}px` }
-                      : {}
-                  }
-                  className="pt-4 flex flex-col justify-start"
+                  key={message.id}
+                  className={cn("flex mb-4", {
+                    "justify-end": message.type === "user",
+                    "justify-start": message.type === "system" || message.type === "file",
+                  })}
                 >
-                  {section.messages.map((message) => renderMessage(message))}
-                </div>
-              )}
+                  <div
+                    className={cn("p-3 rounded-lg shadow-sm", {
+                      "bg-primary text-primary-foreground max-w-[80%]": message.type === "user",
+                      "bg-muted text-black w-[80%]": message.type === "system", // Changed to black text and 80% width
+                      "w-full bg-muted border border-border": message.type === "file", // File messages styling
+                    })}
+                  >
+                    {message.type === "file" && message.fileData ? (
+                      renderFilePreview(message.fileData)
+                    ) : message.type === "system" && streamingMessageId === message.id ? (
+                      // Render streaming words
+                      <div className="whitespace-pre-wrap break-words">
+                        {streamingWords.map((word) => (
+                          <span key={word.id}>{word.text}</span>
+                        ))}
+                        {/* Add blinking cursor during streaming */}
+                        <span className="inline-block w-2 h-4 bg-primary animate-blink ml-1"></span>
+                      </div>
+                    ) : (
+                      // Render completed message content with formatting
+                      <div className="whitespace-pre-wrap break-words">
+                        {message.type === "system" 
+                          ? formatMessageContent(message.content) 
+                          : message.content}
+                      </div>
+                    )}
 
-              {!section.isNewSection && <div>{section.messages.map((message) => renderMessage(message))}</div>}
+                    {/* Feedback buttons for completed system messages */}
+                    {message.type === "system" && message.completed && (
+                      <div
+                          ref={msgIndex === section.messages.length - 1 ? lastCompletedMessageRef : null} // Attach ref to the last message in the section
+                          className="flex items-center justify-end space-x-2 mt-2 pt-2 border-t border-border/20"
+                          >
+                        <Button variant="ghost" size="icon" onClick={() => handleCopyText(message.content)} title="Copy">
+                          <Copy className="h-4 w-4" />
+                        </Button>
+                        <Button variant="ghost" size="icon" onClick={() => handleShareText(message.content)} title="Share">
+                          <Share2 className="h-4 w-4" />
+                        </Button>
+                        <Button variant="ghost" size="icon" onClick={() => handleFeedback(message.id, true)} title="Like">
+                          <ThumbsUp className="h-4 w-4" />
+                        </Button>
+                        <Button variant="ghost" size="icon" onClick={() => handleFeedback(message.id, false)} title="Dislike">
+                          <ThumbsDown className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
           ))}
           <div ref={messagesEndRef} />
         </div>
       </div>
 
-      <div className="fixed bottom-0 left-0 right-0 p-4 bg-gray-50 dark:bg-gray-900 border-t border-gray-200 dark:border-gray-800">
-        <form onSubmit={handleSubmit} className="max-w-3xl mx-auto">
-          <div
-            ref={inputContainerRef}
-            className={cn(
-              "relative w-full rounded-3xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 cursor-text",
-              isStreaming && "opacity-80",
-            )}
-            onClick={handleInputContainerClick}
-          >
-            <div className="pb-9">
-              <Textarea
-                ref={textareaRef}
-                placeholder={isStreaming ? "Waiting for response..." : "Ask Anything"}
-                className="min-h-[24px] max-h-[160px] w-full rounded-3xl border-0 bg-transparent text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500 placeholder:text-base focus-visible:ring-0 focus-visible:ring-offset-0 text-base pl-2 pr-4 pt-0 pb-0 resize-none overflow-y-auto leading-tight"
-                value={inputValue}
-                onChange={handleInputChange}
-                onKeyDown={handleKeyDown}
-                onFocus={() => {
-                  // Ensure the textarea is scrolled into view when focused
-                  if (textareaRef.current) {
-                    textareaRef.current.scrollIntoView({ behavior: "smooth", block: "center" })
-                  }
-                }}
-              />
-            </div>
+      {/* Input Area */}
+      <div
+        ref={inputContainerRef}
+        className={cn(
+          "sticky bottom-0 left-0 right-0 mt-auto p-4 bg-background border-t border-border",
+          "transition-all duration-200 ease-in-out",
+        )}
+        onClick={handleInputContainerClick}
+      >
+        <form onSubmit={handleSubmit} className="mx-auto max-w-3xl">
+          <div className="relative">
+            <Textarea
+              ref={textareaRef}
+              value={inputValue}
+              onChange={handleInputChange}
+              onKeyDown={handleKeyDown}
+              placeholder="Ask me anything..." // Default placeholder
+              className={cn(
+                "w-full resize-none pr-20 py-3 pl-12 min-h-[50px] max-h-[160px] overflow-y-auto",
+                "rounded-full border border-input bg-transparent shadow-sm",
+                "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+              )}
+              rows={1}
+              disabled={isStreaming}
+              style={{ height: "auto" }}
+            />
+            
+            {/* Paperclip (upload) button inside the textarea */}
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="absolute left-2 top-1/2 transform -translate-y-1/2 h-8 w-8 rounded-full"
+              onClick={handleAddButtonClick}
+              disabled={isStreaming}
+              title="Upload File"
+            >
+              <Paperclip className="h-5 w-5" />
+            </Button>
+            
+            {/* Hidden file input */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileChange}
+              className="hidden"
+              accept=".csv, .xlsx, .pdf, .docx, .txt"
+            />
 
-            <div className="absolute bottom-3 left-3 right-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center space-x-2">
-                  <input
-                    type="file"
-                    ref={fileInputRef}
-                    className="hidden"
-                    accept=".csv,.xlsx,.pdf,.doc,.docx,.txt,.png,.jpg,.jpeg,.gif"
-                    onChange={handleFileChange}
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    className={cn(
-                      "rounded-full h-8 w-8 flex-shrink-0 border-gray-200 dark:border-gray-700 p-0 transition-colors",
-                      activeButton === "add" && "bg-gray-100 dark:bg-gray-700 border-gray-300 dark:border-gray-600",
-                    )}
-                    onClick={handleAddButtonClick}
-                    disabled={isStreaming}
-                    aria-label="Upload file"
-                  >
-                    <Plus
-                      className={cn(
-                        "h-4 w-4 text-gray-500 dark:text-gray-400",
-                        activeButton === "add" && "text-gray-700 dark:text-gray-300",
-                      )}
-                    />
-                  </Button>
-
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className={cn(
-                      "rounded-full h-8 px-3 flex items-center border-gray-200 dark:border-gray-700 gap-1.5 transition-colors",
-                      activeButton === "deepSearch" &&
-                        "bg-gray-100 dark:bg-gray-700 border-gray-300 dark:border-gray-600",
-                    )}
-                    onClick={() => toggleButton("deepSearch")}
-                    disabled={isStreaming}
-                  >
-                    <Search
-                      className={cn(
-                        "h-4 w-4 text-gray-500 dark:text-gray-400",
-                        activeButton === "deepSearch" && "text-gray-700 dark:text-gray-300",
-                      )}
-                    />
-                    <span
-                      className={cn(
-                        "text-gray-900 dark:text-gray-100 text-sm",
-                        activeButton === "deepSearch" && "font-medium",
-                      )}
-                    >
-                      DeepSearch
-                    </span>
-                  </Button>
-
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className={cn(
-                      "rounded-full h-8 px-3 flex items-center border-gray-200 dark:border-gray-700 gap-1.5 transition-colors",
-                      activeButton === "think" && "bg-gray-100 dark:bg-gray-700 border-gray-300 dark:border-gray-600",
-                    )}
-                    onClick={() => toggleButton("think")}
-                    disabled={isStreaming}
-                  >
-                    <Lightbulb
-                      className={cn(
-                        "h-4 w-4 text-gray-500 dark:text-gray-400",
-                        activeButton === "think" && "text-gray-700 dark:text-gray-300",
-                      )}
-                    />
-                    <span
-                      className={cn(
-                        "text-gray-900 dark:text-gray-100 text-sm",
-                        activeButton === "think" && "font-medium",
-                      )}
-                    >
-                      Think
-                    </span>
-                  </Button>
-                </div>
-
-                <Button
-                  type="submit"
-                  variant="outline"
-                  size="icon"
-                  className={cn(
-                    "rounded-full h-8 w-8 border-0 flex-shrink-0 transition-all duration-200",
-                    hasTyped ? "bg-black dark:bg-white scale-110" : "bg-gray-200 dark:bg-gray-700",
-                  )}
-                  disabled={!inputValue.trim() || isStreaming}
-                >
-                  <ArrowUp
-                    className={cn(
-                      "h-4 w-4 transition-colors",
-                      hasTyped ? "text-white dark:text-black" : "text-gray-500 dark:text-gray-400",
-                    )}
-                  />
-                  <span className="sr-only">Submit</span>
-                </Button>
-              </div>
-            </div>
+            {/* Submit Button */}
+            <Button
+              type="submit"
+              size="icon"
+              className={cn(
+                "absolute right-3 top-1/2 transform -translate-y-1/2 h-8 w-8 rounded-full",
+                "transition-opacity duration-200 bg-primary text-primary-foreground",
+                !hasTyped && "opacity-70"
+              )}
+              disabled={isStreaming || !inputValue.trim()}
+              title="Send Message"
+            >
+              <ArrowUp className="h-5 w-5" />
+            </Button>
           </div>
         </form>
       </div>

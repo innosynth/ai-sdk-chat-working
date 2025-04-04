@@ -1,0 +1,10 @@
+This is a test file for the server.
+It contains multiple lines to test chunking.
+The server should be able to process this file.
+It should extract text content and create vector embeddings.
+This is line 5 of the test file.
+This is line 6 of the test file.
+This is line 7 of the test file.
+This is line 8 of the test file.
+This is line 9 of the test file.
+This is the last line of the test file.
